@@ -451,6 +451,79 @@ Without OSIV, if you modify an entity without calling `save()`, the change is si
 
 ---
 
+## JPA/Hibernate vs alternatives: is it a tooling problem?
+
+The OSIV problem **only exists because Hibernate manages the session and lazy loading for you**. If you use a different tool to access the database, the problems disappear -- but so do the conveniences.
+
+### Tool and problem map
+
+| Tool | Lazy loading? | OSIV applies? | N+1 possible? | Dirty checking? |
+|---|:---:|:---:|:---:|:---:|
+| **JPA/Hibernate** | Yes (proxies) | Yes | Yes | Yes |
+| **Spring JdbcClient** | No | No | No | No |
+| **jOOQ** | No | No | No | No |
+| **MyBatis** | Configurable | No | Configurable | No |
+| **Spring Data R2DBC** | No | No | No | No |
+| **Native queries via JPA** | No (flat result) | Session still open | No | Yes (if you touch entities) |
+
+With JdbcClient (or JdbcTemplate, jOOQ, etc.) you write the SQL yourself: no proxies, no persistent session, no lazy loading, no accidental dirty checking. You control exactly what data is loaded and when.
+
+### JPA DTO Projection vs JdbcClient -- same query, same result
+
+Both execute the same SQL query and return the same `StoreProjection`. The difference is the overhead:
+
+| Records | JPA DTO Projection | JdbcClient | Difference |
+|---:|---:|---:|---|
+| 1K | 96ms | 9ms | JDBC 10x faster |
+| 10K | 22ms | 21ms | Similar |
+| 100K | 159ms | 93ms | JDBC 1.7x faster |
+| 500K | 1,437ms | 1,430ms | Similar |
+
+At low record counts (cold start), JPA has query parser initialization overhead. At high volume, the difference fades because the bottleneck is data transfer, not the framework.
+
+> **Test:** `JpaVsJdbcTest.jpaVsJdbcProjection()` -- same query, same data, two different paths.
+
+### @EntityGraph (full entity) vs JdbcClient (minimal DTO) -- real overhead
+
+This is where the difference shows: @EntityGraph loads full entities with persistence context and snapshots for dirty checking. JdbcClient returns flat DTOs with no overhead.
+
+| Records | @EntityGraph | JdbcClient | Ratio |
+|---:|---:|---:|---|
+| 1K | 111ms | 6ms | **18.5x** slower |
+| 10K | 93ms | 34ms | **2.7x** slower |
+| 100K | 542ms | 275ms | **2.0x** slower |
+
+At 1K records, the persistence context overhead (creating managed entities, snapshots for dirty checking, L1 cache) is **18x** more expensive than mapping rows to flat records. At 100K the difference shrinks to 2x because data transfer dominates.
+
+> **Test:** `JpaVsJdbcTest.entityGraphVsJdbc()` -- same data, @EntityGraph vs JdbcClient.
+
+### What you lose when leaving JPA
+
+| What you lose | Impact |
+|---|---|
+| Automatic dirty checking | You must issue an explicit UPDATE for every change |
+| Cascade persist/merge/remove | You must manage relationships manually |
+| L1 cache (persistence context) | Repeated queries for the same ID hit the database |
+| Declarative `@EntityGraph` | You write the JOINs by hand |
+| Entity inheritance | Manual mappings per type |
+| Optimistic locking (`@Version`) | You implement it yourself with WHERE version = ? |
+| Spring Data repositories | You write the queries yourself |
+
+### When it is worth leaving JPA
+
+- **Read-only endpoints with high traffic**: JdbcClient + DTO is faster and simpler
+- **Reports and aggregations**: native SQL is more expressive than JPQL for GROUP BY, window functions, CTEs
+- **Bulk operations**: mass INSERT/UPDATE is orders of magnitude faster without persistence context
+- **Stateless microservices**: if you do not need dirty checking or cascade, JPA is unnecessary overhead
+
+### When JPA remains the best choice
+
+- **CRUD with complex relationships**: cascade and dirty checking save a lot of boilerplate
+- **Domains with business logic in entities**: DDD with rich domain models
+- **Large teams**: JPA/Spring Data conventions reduce code variability
+
+---
+
 ## Decision tree
 
 ```

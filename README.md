@@ -50,6 +50,7 @@ docker compose up -d
 | `solutions/` (N+1 cardinality) | N+1 depends on distinct referenced entities, not parent count |
 | `solutions/` (readOnly) | `readOnly=true` disables dirty checking |
 | `dirtychecking/` | Password bug: OSIV auto-flush hides missing `save()` |
+| `solutions/JpaVsJdbcTest` | JPA/Hibernate vs JdbcClient: same query, different overhead (1K-500K) |
 | `write/` | Cascade persist, bulk insert, `jdbc.batch_size`, optimistic locking |
 
 ## Key findings
@@ -62,6 +63,9 @@ docker compose up -d
 - **10M records**: ALL solutions OOM with `findAll()` — pagination or streaming required.
 - **`jdbc.batch_size`**: does NOT work with `GenerationType.IDENTITY`.
 - **`readOnly=true`**: prevents accidental dirty checking flush.
+- **JPA DTO Projection vs JdbcClient**: similar performance at high volume (500K), but JdbcClient 10x faster at 1K due to Hibernate query parser overhead.
+- **`@EntityGraph` vs JdbcClient**: 2-18x slower due to persistence context + dirty checking snapshots.
+- **OSIV problems are JPA/Hibernate-specific** — JdbcClient, jOOQ, MyBatis don't have lazy loading, sessions, or dirty checking.
 
 ## Companion article
 

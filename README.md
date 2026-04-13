@@ -48,6 +48,9 @@ docker compose up -d
 | `solutions/` (pagination) | `@EntityGraph` + `Pageable` = in-memory pagination trap |
 | `solutions/` (over-fetching) | `@EntityGraph` loads all columns vs DTO minimal fetch |
 | `solutions/` (N+1 cardinality) | N+1 depends on distinct referenced entities, not parent count |
+| `solutions/SubselectFetchTest` | `@Fetch(SUBSELECT)`: constant 7 queries regardless of parent count |
+| `solutions/BatchSizePerCollectionTest` | `@BatchSize` per-collection: same as global but fine-grained |
+| `solutions/ImmutableEntityTest` | `@Immutable`: zero dirty checking, modifications silently ignored |
 | `solutions/` (readOnly) | `readOnly=true` disables dirty checking |
 | `dirtychecking/` | Password bug: OSIV auto-flush hides missing `save()` |
 | `solutions/JpaVsJdbcTest` | JPA/Hibernate vs JdbcClient: same query, different overhead (1K-500K) |
@@ -60,6 +63,8 @@ docker compose up -d
 - **`batch_fetch_size=16`**: 16x query reduction, best cost/benefit. 4 queries constant up to 1M records with shared refs.
 - **Split Queries**: 7 queries constant regardless of collection size (5 to 5,000 items).
 - **DTO Projection**: always 1 query (or 7 for collections), no entities in memory, fastest at scale.
+- **`@Fetch(FetchMode.SUBSELECT)`**: 7 queries constant for any N (vs batch_fetch's ceil(N/16)*7) -- best for large findAll with collections.
+- **`@Immutable`** entities skip dirty checking entirely -- less memory, but modifications silently ignored.
 - **10M records**: ALL solutions OOM with `findAll()` — pagination or streaming required.
 - **`jdbc.batch_size`**: does NOT work with `GenerationType.IDENTITY`.
 - **`readOnly=true`**: prevents accidental dirty checking flush.

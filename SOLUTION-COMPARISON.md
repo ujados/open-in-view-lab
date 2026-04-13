@@ -162,6 +162,92 @@ It is not the most optimal solution in absolute query count, but it has the **be
 
 ---
 
+## 3b. `@BatchSize` per-collection
+
+```java
+@OneToMany
+@JoinColumn(name = "department_id")
+@BatchSize(size = 16)
+private List<Employee> employees = new ArrayList<>();
+```
+
+Same effect as `default_batch_fetch_size=16` but with per-collection granularity. You can set `@BatchSize(size = 50)` on a large collection and `@BatchSize(size = 8)` on a small one.
+
+For 25 departments with 6 collections x 5 items: **13 queries** (vs 176 without anything, vs 14 with global batch_fetch).
+
+> **Test:** `BatchSizePerCollectionTest` -- 13 queries, same effect as global batch_fetch.
+
+**Hibernate 7 note:** `@BatchSize` only works on `@OneToMany` collections. On `@ManyToOne` it is no longer supported -- use `default_batch_fetch_size` globally for ManyToOne.
+
+| Pros | Cons |
+|---|---|
+| Granular control per collection | Annotation on each collection (more verbose) |
+| Allows different batch sizes | Does not work on @ManyToOne (Hibernate 7) |
+
+**When to use:** when you need different batch sizes per collection. If a single size works for everything, use `default_batch_fetch_size` globally.
+
+---
+
+## 3c. `@Fetch(FetchMode.SUBSELECT)`
+
+```java
+@OneToMany
+@JoinColumn(name = "department_id")
+@Fetch(FetchMode.SUBSELECT)
+private List<Employee> employees = new ArrayList<>();
+```
+
+SUBSELECT loads ALL collections of a given type in **1 single query** using a subquery that repeats the original query:
+
+```sql
+SELECT * FROM employees WHERE department_id IN (SELECT id FROM departments)
+```
+
+Unlike `batch_fetch_size` which groups into chunks of 16, SUBSELECT always issues 1 query per collection type **regardless of the number of parents**.
+
+| Depts | SUBSELECT | batch_fetch=16 | Without anything |
+|---:|---:|---:|---:|
+| 5 | 7 | 8 | 36 |
+| 25 | **7** | 14 | 176 |
+| 100 | **7** | 44 | 701 |
+
+With 25 departments: SUBSELECT issues **7 queries** vs 14 for batch_fetch -- half as many. With 100 departments: **7 vs 44** -- 6x fewer. SUBSELECT does not grow with N.
+
+> **Test:** `SubselectFetchTest` -- 7 constant queries for 5, 25, and 100 departments. Comparison with batch_fetch and without anything.
+
+| Pros | Cons |
+|---|---|
+| Always 1 query per collection type | Repeats the original query as a subquery (can be expensive if the original query is complex) |
+| Does not grow with N (constant) | Not globally configurable (per-collection only) |
+| Better than batch for large N | Loads ALL collections, not just a batch |
+
+**When to use:** entities with `@OneToMany` collections where you load many parents at once (findAll, listings). It is the best option when `N > 16` and batch_fetch starts making multiple rounds. **Do not use** if the original query is expensive (the subquery repeats it entirely).
+
+---
+
+## 3d. `@Immutable`
+
+```java
+@Entity
+@Immutable
+public class DepartmentReadOnly { ... }
+```
+
+Marks an entity as read-only at the Hibernate level. **Zero dirty checking**: no snapshots are created, no changes are detected, no flush occurs. Modifications are silently ignored.
+
+The lab confirms it: modifying the name of an `@Immutable` entity without calling `save()` does not persist anything. With a normal entity, dirty checking detects it and persists at commit time.
+
+> **Test:** `ImmutableEntityTest` -- `@Immutable` ignores modifications vs a normal entity that persists them via dirty checking.
+
+| Pros | Cons |
+|---|---|
+| Zero dirty checking overhead | You cannot write with this entity |
+| Less memory (no snapshots) | Modifications silently ignored (dangerous if you do not know it is immutable) |
+
+**When to use:** **read-only** entities such as views, catalog tables, historical data. Useful for read endpoints where you know you will never modify the entity.
+
+---
+
 ## 4. Split Queries
 
 ```java
@@ -571,39 +657,52 @@ At 1K records, the persistence context overhead (creating managed entities, snap
 
 4. Do you need the JPA entity or just flat data?
 
-   JUST DATA --> DTO Projection
-       Store (ManyToOne): 1 query, 0 entities
+   JUST DATA --> DTO Projection or Interface Projection
+       Store (ManyToOne): 1 query, 0 entities, 56 MB for 100K
        (Test: DtoProjectionTest -- prepared=1, entityFetch=0)
+       (Test: InterfaceProjectionTest -- same efficiency, less boilerplate)
        Department (collections): 7 queries (1 base + 6 selects), 0 entities
        (Test: DepartmentDtoProjectionTest -- prepared=7, entityFetch=0)
        Less over-fetching: only transfers the columns you need
-       (Test: OverFetchingTest -- @EntityGraph loads everything vs DTO only what is needed)
-       At scale: the fastest -- 3.2s for 1M vs 5.5s for @EntityGraph
-       (Test: LargeScaleVolumetryTest -- DTO vs EntityGraph at 1M)
+       (Test: OverFetchingTest -- @EntityGraph 117 MB vs DTO 56 MB for 100K)
+       Alternative without JPA: JdbcClient (2-18x faster than @EntityGraph)
+       (Test: JpaVsJdbcTest -- same query, less overhead)
 
-   NEED ENTITY --> (continue)
+   NEED ENTITY --> Is it read-only?
+       YES --> Consider @Immutable (no dirty checking, no snapshots)
+               (Test: ImmutableEntityTest -- modifications ignored)
+       NO  --> (continue)
 
 5. Does the entity have multiple collections (>1 List/Set)?
 
-   YES --> Split Queries (1 JOIN FETCH per collection, L1 cache merge)
+   YES --> How many parents do you load at once?
+
+       1 SINGLE PARENT (findById) --> Split Queries
            7 constant queries from 5 to 5,000 items per collection
-           NEVER @EntityGraph here:
-             - With List: MultipleBagFetchException
-             - With Set: silent cartesian product (5^3 = 125 rows for 15 items)
            (Test: SplitQueryTest -- 7 queries, 0 cartesian product)
-           (Test: CartesianProductTest -- MultipleBagFetchException with List)
-           (Test: CartesianProductWithSetsTest -- silent cartesian product with Set)
            (Test: LargeScaleDepartmentTest -- 7 constant queries up to 5K items/col)
+
+       MANY PARENTS (findAll) --> @Fetch(FetchMode.SUBSELECT)
+           Always 7 queries (1 base + 6 subselects) REGARDLESS OF N
+           Better than batch_fetch when N > 16
+           (Test: SubselectFetchTest -- 7 queries for 5, 25, and 100 departments)
+           Alternative: @BatchSize(16) per-collection (same effect as global)
+           (Test: BatchSizePerCollectionTest -- 13 queries for 25 depts)
+
+       NEVER @EntityGraph with multiple collections:
+         - With List: MultipleBagFetchException
+         - With Set: silent cartesian product (5^3 = 125 rows for 15 items)
+         (Test: CartesianProductTest + CartesianProductWithSetsTest)
+
    NO  --> (continue)
 
 6. How many ManyToOne relationships does it have?
 
    1-3 ManyToOne --> @EntityGraph (1 JOIN query)
                      Works well up to 1M records (5.5s at 1M)
-                     Beware of over-fetching: loads all columns
+                     Beware of over-fetching: loads all columns (117 MB vs 56 MB)
                      (Test: EntityGraphQueryCountTest -- prepared=1)
-                     (Test: LargeScaleVolumetryTest -- 1 query up to 1M)
-                     (Test: OverFetchingTest -- over-fetching vs DTO)
+                     (Test: MemoryFootprintTest -- 117 MB vs 56 MB for 100K)
 
    Many or deep --> @Transactional(readOnly=true) + batch_fetch
                     (Test: LargeScaleBatchFetchTest -- 16x reduction)

@@ -1,0 +1,570 @@
+# Solution comparison: disabling Open-in-View
+
+When you disable `spring.jpa.open-in-view=false`, every lazy relationship accessed outside an explicit transaction blows up with `LazyInitializationException`. The question is no longer *whether* to disable it, but *how* to load the data you need without relying on the OSIV filter's open session.
+
+There is no single correct solution. Each strategy has a different range of applicability, and the best choice depends on the shape of the entities you work with: how many relationships they have, whether they are `ManyToOne` or collections, and whether you need the entity for writes or just for reads.
+
+Below I present five strategies, measured with Hibernate Statistics on a real PostgreSQL instance (Testcontainers), with the exact numbers the lab produced. All tests in the project pass green and back every number shown here.
+
+---
+
+## Summary table
+
+| Solution | Queries (10 Store, 3 ManyToOne) | Queries (1 Dept, 6 collections x5) | Cartesian product? | Effort |
+|---|:---:|:---:|:---:|---|
+| `@EntityGraph` | **1** | `MultipleBagFetchException` | Yes | Annotation on repository |
+| `@Transactional(readOnly=true)` | 7 or 31 (*) | 8 | No | Annotation on service |
+| `batch_fetch_size=16` | **4** | 8 | No | 1 line in `application.yml` |
+| Split Queries | n/a (ManyToOne does not need split) | **7** | No | Manual code |
+| DTO Projection | **1** | **7** | No | JPQL query + record/DTO |
+
+> (*) 7 queries when the 10 stores share 2 references of each type. **31 queries** when each store has unique references. The N+1 depends on the cardinality of the referenced entities, not the number of parent entities. Test: `NPlusOneCardinalityTest`.
+
+---
+
+## 1. `@EntityGraph`
+
+```java
+@EntityGraph(attributePaths = {"storeType", "region", "timezone"})
+List<Store> findAllWithAllRelationsBy();
+```
+
+Hibernate generates a single `SELECT` with a `LEFT JOIN` for each declared relationship. For `Store` with 3 `ManyToOne` relations, the result is **1 query** returning 10 rows.
+
+> **Test:** `EntityGraphQueryCountTest` -- `prepared=1, entityFetch=0, queryExec=1`
+
+### The problem with collections
+
+If you try an `@EntityGraph` on `Department` with 6 `List<>` fields, Hibernate throws `MultipleBagFetchException` because it cannot fetch multiple bags (lists) in a single query. Even if you changed the lists to `Set`, you would get a silent cartesian product: with 5 items per collection, the query would return 5^6 = 15,625 rows for a single department.
+
+> **Test:** `CartesianProductTest` -- captures the `MultipleBagFetchException` and demonstrates that `@EntityGraph` with multiple `List` does not work.
+
+### The List-to-Set workaround: worse than the disease
+
+The usual "solution" found on StackOverflow is to change `List` to `Set`. This avoids the exception but produces a **silent cartesian product**. With 3 `Set` collections of 5 items each, the database returns 5 * 5 * 5 = **125 rows** for 15 actual items. Hibernate deduplicates in memory, so the result looks correct -- but the data transfer is explosive.
+
+With 50 items per collection: 50^3 = **125,000 rows** for 150 items. This is worse than `MultipleBagFetchException` because it is completely silent.
+
+> **Test:** `CartesianProductWithSetsTest` -- demonstrates that with `Set` the query returns 1 result, Hibernate shows 5+5+5 correct items, but the database transferred 125 rows.
+
+### The pagination trap
+
+**This is critical and easy to overlook.** If you combine `@EntityGraph` with `Pageable` on a collection, Hibernate issues the warning `HHH90003004` and paginates **in memory**: it loads ALL rows from the database and trims in Java. The generated SQL has no `LIMIT`/`OFFSET`.
+
+With 10 departments requesting a page of 3:
+- `page.getContent().size()` returns 3 (looks correct)
+- `page.getTotalElements()` returns 10
+- But Hibernate loaded all 10 departments with all their employees into memory before returning 3
+
+With 100K records this kills the application without warning.
+
+> **Test:** `PaginationTrapTest` -- demonstrates that `findAllWithEmployeesBy(PageRequest.of(0, 3))` loads all 10 departments into memory, while `findAll(PageRequest.of(0, 3))` uses real `LIMIT`/`OFFSET`.
+
+| Pros | Cons |
+|---|---|
+| Single SQL query | Cartesian product with multiple collections |
+| Zero extra configuration | `MultipleBagFetchException` with >1 `List` |
+| Declarative and readable | In-memory pagination with collections |
+| | Does not scale to complex graphs |
+
+**When to use:** entities with **1-2 `ManyToOne` relationships** or **a single collection without pagination**. The classic case: `Product` with its `Category`, `Store` with `StoreType`/`Region`/`Timezone`.
+
+---
+
+## 2. `@Transactional(readOnly = true)`
+
+```java
+@Transactional(readOnly = true)
+public List<StoreDto> getAllStoresTransactional() {
+    return storeRepository.findAll().stream()
+            .map(storeMapper::toDto)
+            .toList();
+}
+```
+
+The annotation keeps the Hibernate session open for the entire method. Each lazy relationship is loaded on demand when the mapper accesses it.
+
+### N+1 depends on cardinality, not on parent count
+
+It is easy to assume that 10 stores with 3 `ManyToOne` relationships generate 31 queries (1 + 3*10). But the lab measured two distinct scenarios:
+
+| Scenario | Queries | Why |
+|---|:---:|---|
+| 10 stores, 2 shared storeTypes/regions/tz | **7** | 1 base + 2 + 2 + 2 (distinct referenced entities) |
+| 10 stores, each with **unique** refs | **31** | 1 base + 10 + 10 + 10 (all refs are distinct) |
+
+Hibernate does not fire 1 query per proxy, but 1 per **distinct referenced entity**. If 10 stores point to the same 2 `StoreType` values, Hibernate only loads those 2 -- not 10. The N+1 is proportional to the cardinality of the referenced entities, not the number of parent entities.
+
+In production, where catalogs (types, regions, time zones) are typically small shared tables, the real N+1 is much lower than the theoretical calculation suggests. But if each parent entity references something unique (like `createdBy` pointing to distinct users), the N+1 hits at full force.
+
+> **Test:** `NPlusOneCardinalityTest` -- `sharedReferencesReduceNPlusOne` measures 7, `uniqueReferencesMaximizeNPlusOne` measures 31. Same 10 stores, different cardinality.
+
+### readOnly=true disables dirty checking
+
+`readOnly=true` is not just a semantic optimization. Hibernate sets `FlushMode.MANUAL`, which means:
+- Modifications to entities within the transaction **are not persisted**
+- Hibernate can skip state snapshots (less memory per entity)
+- There is no automatic flush on commit
+
+The lab demonstrates this directly: in a `readOnly=true` transaction, modifying the name of 5 stores without calling `save()` persists nothing. In a normal transaction, dirty checking detects the changes and persists them automatically on commit.
+
+> **Test:** `ReadOnlyOptimizationTest` -- `readOnlySkipsDirtyChecking` modifies entities without save -> not persisted. `readWriteFlushesChanges` does the same without readOnly -> changes persisted.
+
+| Pros | Cons |
+|---|---|
+| Works with any depth | N+1 queries (severity depends on cardinality) |
+| No cartesian product | Holds a pool connection for the entire method |
+| readOnly=true reduces memory | If the method is slow, the connection is wasted |
+
+**When to use:** as a **universal fallback** for deep graphs or entities with many relationships. **Always combined with `batch_fetch_size`** to reduce the N+1. And always with `readOnly=true` on read methods.
+
+### Beware of connection retention
+
+`@Transactional` holds a HikariCP pool connection for the entire method execution. If the method contains slow logic (heavy mapping, HTTP calls, processing), that connection is blocked without executing SQL.
+
+With virtual threads and a small pool, this reproduces exactly the same pattern that caused the deadlock with OSIV: too many threads holding connections for too long. The lab's deadlock test (`DeadlockReproductionTest`) demonstrates this pattern with `pool=2` and 4 concurrent virtual threads.
+
+> **Test:** `DeadlockReproductionTest` -- 4 concurrent requests with pool=2 and OSIV+TransactionTemplate.
+
+---
+
+## 3. `default_batch_fetch_size`
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        default_batch_fetch_size: 16
+```
+
+A single line of configuration that changes how Hibernate loads lazy relationships. Instead of issuing 1 query per uninitialized proxy, Hibernate groups up to 16 proxies of the same type into a single query with `WHERE id IN (?, ?, ..., ?)`.
+
+| Scenario | Without batch | With batch=16 | Reduction |
+|---|:---:|:---:|:---:|
+| 10 stores, 3 ManyToOne (shared refs) | 7 | **4** | 43% |
+| 10 stores, 3 ManyToOne (unique refs) | 31 | **4** | 87% |
+| 1 dept, 6 collections x5 items | 8 | **8** | 0% |
+
+Batch fetch shines with `ManyToOne` relationships where there are many distinct references: it converts 31 queries into 4 (1 base + 1 batch per type). For `OneToMany` collections, the benefit is smaller because each collection is already loaded in 1 query per parent entity.
+
+> **Test:** `BatchSizeQueryCountTest` -- `batchFetchReducesStoreQueries` measures `prepared=4`. `batchFetchReducesDepartmentQueries` measures `prepared=8`.
+
+It is not the most optimal solution in absolute query count, but it has the **best cost-to-benefit ratio** of the entire list. It requires no code changes, produces no cartesian product, and improves *the entire project* in one shot.
+
+| Pros | Cons |
+|---|---|
+| 1 line of config, global improvement | Not 1 query (it is 1 + ceil(N/batch) per type) |
+| No cartesian product | Requires `@Transactional` to work |
+| Greatest impact with high-cardinality ManyToOne | Less impact on OneToMany collections |
+
+**When to use:** **always. In every Hibernate project.** It is the minimum baseline before optimizing case by case. If you can only do one thing from this list, this is it.
+
+---
+
+## 4. Split Queries
+
+```java
+@Transactional(readOnly = true)
+public DepartmentDto getDepartmentSplitQueries(Long id) {
+    Department dept = departmentRepository.findWithEmployeesById(id).orElseThrow();
+    departmentRepository.findWithProjectsById(id);   // L1 cache merge
+    departmentRepository.findWithBudgetsById(id);     // L1 cache merge
+    departmentRepository.findWithEquipmentById(id);   // L1 cache merge
+    departmentRepository.findWithPoliciesById(id);    // L1 cache merge
+    departmentRepository.findWithDocumentsById(id);   // L1 cache merge
+    return departmentMapper.toDto(dept);
+}
+```
+
+Each query does a `JOIN FETCH` of exactly one collection. Hibernate executes **7 queries**, but since they all run within the same transaction and the same `EntityManager`, the L1 cache merges the results: the `dept` entity ends up with all its collections loaded without a cartesian product.
+
+> **Test:** `SplitQueryTest` -- `prepared=7, entityFetch=1, collectionFetch=0, queryExec=6`. Verifies that the 6 collections (employees, projects, budgets, equipment, policies, documents) have 5 items each.
+
+This is the strategy that Vlad Mihalcea recommends for the specific case where `@EntityGraph` would blow up (multiple collections) and `@Transactional` alone would generate N+1.
+
+| Pros | Cons |
+|---|---|
+| No cartesian product | More manual code |
+| No uncontrolled N+1 | 1 query per collection (predictable) |
+| Full control over SQL | Coupled to the entity structure |
+| L1 cache merges results automatically | Requires `JOIN FETCH` queries in the repository |
+
+**When to use:** entities with **multiple large collections** where `@EntityGraph` throws `MultipleBagFetchException`. The typical case: `Department` with 6 collections, `Order` with `items` + `payments` + `history`.
+
+---
+
+## 5. DTO Projection
+
+```java
+@Transactional(readOnly = true)
+public List<StoreProjection> getAllStoresProjection() {
+    return entityManager.createQuery(
+        "SELECT new com.example.osivlab.dto.StoreProjection(" +
+            "s.id, s.name, s.address, st.name, r.name, tz.zoneId) " +
+        "FROM Store s " +
+        "LEFT JOIN s.storeType st " +
+        "LEFT JOIN s.region r " +
+        "LEFT JOIN s.timezone tz",
+        StoreProjection.class)
+        .getResultList();
+}
+```
+
+No entities loaded. No persistence context. No dirty checking. No lazy loading. A single SQL query that returns exactly the fields you need, mapped directly to a `record`.
+
+For 10 stores: **1 query, 0 entities loaded, 0 entity fetches**.
+
+> **Test:** `DtoProjectionTest` -- `prepared=1, entityFetch=0, collectionFetch=0, queryExec=1`.
+
+### DTO Projection for entities with collections
+
+For `Department` with 6 collections, a single flat JPQL query does not work. The solution is **7 separate queries**: 1 base (native) + 6 JPQL selects that return `List<String>` directly, without loading any entity.
+
+```java
+public DepartmentProjection getDepartmentProjection(Long id) {
+    Tuple base = entityManager.createNativeQuery(
+        "SELECT d.id, d.name, d.code, r.name FROM departments d " +
+        "LEFT JOIN regions r ON d.region_id = r.id WHERE d.id = :id", Tuple.class)
+        .setParameter("id", id).getSingleResult();
+    List<String> employees = entityManager.createQuery(
+        "SELECT e.name FROM Employee e WHERE e.department.id = :id", String.class)
+        .setParameter("id", id).getResultList();
+    // ... 5 more queries for the other collections
+}
+```
+
+The 7 queries are identical in count to Split Queries, but without loading entities or a persistence context. For collections of 5,000 items, DTO Projection and Split Queries have the same number of queries (7) and similar times (~60-114ms).
+
+> **Test:** `DepartmentDtoProjectionTest` -- `prepared=7, entityFetch=0, collectionFetch=0, queryExec=7`.
+
+| Pros | Cons |
+|---|---|
+| 1 query, optimal SQL | Not usable for writes |
+| 0 risk of `LazyInitializationException` | More boilerplate (query + DTO/record) |
+| No entities in memory, no snapshots | Each endpoint needs its own query |
+| Compatible with real pagination | No dirty checking (both an advantage and a limitation) |
+
+**When to use:** **read-only** endpoints that do not need the entity for later modification. Listings, reports, detail views without editing, high-traffic endpoints.
+
+---
+
+## Cross-cutting trade-offs
+
+### Dirty checking is a double-edged sword
+
+Hibernate's automatic dirty checking is convenient but dangerous. With OSIV enabled, an entity that is accidentally modified gets persisted without anyone having called `save()`. The lab demonstrates this: a service without `@Transactional` that changes an employee's password and never calls `save()` works with OSIV (because a subsequent `TransactionTemplate` triggers the auto-flush) but silently loses the change without OSIV.
+
+> **Test:** `PasswordBugTest` -- with OSIV=true, `changePasswordBuggy()` persists the password. With OSIV=false, the password is lost. `changePasswordCorrect()` with `saveAndFlush()` works in both cases.
+
+The solution is to use `readOnly=true` on all read transactions (disables flush) and be explicit with `save()`/`saveAndFlush()` on write transactions.
+
+> **Test:** `ReadOnlyOptimizationTest` -- confirms that `readOnly=true` prevents persistence via dirty checking.
+
+### LazyInitializationException is your friend
+
+With OSIV disabled, the first error you will see is `LazyInitializationException`. It is not a bug -- it is Hibernate telling you that you tried to load data outside an open session. With OSIV enabled, that access would have worked silently, generating N+1 queries that you do not see in the logs.
+
+> **Test:** `LazyInitExceptionTest` -- with OSIV=true, `GET /employees/{id}` (without `@Transactional`) returns 200. With OSIV=false, it throws `LazyInitializationException`. With `@Transactional` or `@EntityGraph`, it works in both cases.
+
+---
+
+## Volumetry: how each solution scales
+
+All numbers in this section come from `VolumetryComparisonTest` and `VolumetryBatchFetchTest`, executed on real PostgreSQL with Testcontainers.
+
+### Store (3 ManyToOne) -- queries by solution
+
+| Records | @EntityGraph | @Transactional (shared) | @Transactional (unique) | batch=16 (unique) | DTO Projection |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 1 | 7 | 301 | 22 | 1 |
+| 1K | 1 | 7 | 3,001 | 190 | 1 |
+| 10K | 1 | 7 | 30,001 | 1,876 | 1 |
+| 100K | 1 | 7 | 300,001* | 18,751 | 1 |
+| 1M | 1 | 7 | --- | --- | 1 |
+
+> (*) 100K with unique refs without batch = 300,001 queries. Not executed because it is impractical (would take hours). With batch=16, it drops to 18,751 -- **16x constant reduction**.
+
+`@EntityGraph` and DTO Projection stay at **1 query** up to 1M records. `@Transactional` with shared refs (catalogs) stays at **7 constant queries** up to 1M. With unique refs, it scales linearly: `1 + N*3`.
+
+> **Test:** `LargeScaleVolumetryTest` + `LargeScaleBatchFetchTest` + `VolumetryComparisonTest`
+
+### Store -- read times (ms)
+
+| Records | @EntityGraph | DTO Projection | @Transactional (shared) | batch=16 (shared) | @Transactional (unique) |
+|---:|---:|---:|---:|---:|---:|
+| 1K | 206 | 109 | 96 | 35 | 2,134 |
+| 10K | 136 | 26 | 91 | 35 | 14,737 |
+| 100K | 434 | 122 | 366 | 459 | --- |
+| 500K | 2,646 | 1,551 | 1,590 | 1,892 | --- |
+| 1M | 5,509 | 3,276 | 3,153 | 4,655 | --- |
+| **10M** | **OOM** | **OOM** | **OOM** | **OOM** | --- |
+
+**At 10M records, all solutions fail with `OutOfMemoryError` (4GB heap)**, because no solution based on `findAll()` is designed to return millions of objects in a `List<>`. The solution at that volume is **pagination** (with the caveats of `@EntityGraph` + collections) or **streaming with `@QueryHints(FETCH_SIZE)`**.
+
+DTO Projection is consistently the fastest: at 1M records, **3.2 seconds** versus 5.5s for @EntityGraph. The difference is the persistence context overhead: EntityGraph loads entities with snapshots for dirty checking, DTO Projection only creates flat records.
+
+> **Test:** `LargeScaleVolumetryTest` (1K-1M) + `TenMillionTest` (10M, OOM confirmed)
+
+### Impact of cardinality on N+1
+
+With `@Transactional`, the number of queries **does not depend on the number of parents**, but on the number of **distinct referenced entities**:
+
+| Records | Shared refs (2 of each type) | Unique refs (1 per store) |
+|---:|---:|---:|
+| 1K | **7** | 3,001 |
+| 10K | **7** | 30,001 |
+| 100K | **7** | 300,001 |
+| 1M | **7** | 3,000,001* |
+
+With shared refs (typical catalogs), **the N+1 does not grow** even with 1M records. With unique refs, it grows linearly and becomes impractical beyond ~10K.
+
+> **Test:** `NPlusOneCardinalityTest` + `LargeScaleVolumetryTest`
+
+### batch_fetch_size=16 at scale (shared refs)
+
+| Records | Queries | Time |
+|---:|---:|---:|
+| 1K | 4 | 35ms |
+| 10K | 4 | 35ms |
+| 100K | 4 | 459ms |
+| 500K | 4 | 1,892ms |
+| 1M | **4** | **4,655ms** |
+
+With shared refs, `batch_fetch_size` stays at **4 queries up to 1M records** (1 base + 1 batch per relationship type). Time grows linearly with data volume, not with query count.
+
+> **Test:** `LargeScaleBatchFetchTest`
+
+### Department (6 collections) -- collections are constant
+
+| Items/collection | @Transactional | Split Queries |
+|---:|---:|---:|
+| 3 | 8 | 7 |
+| 10 | 8 | 7 |
+| 25 | 8 | 7 |
+| 50 | 8 | 7 |
+
+The number of items per collection **does not affect the query count**: Hibernate loads each collection in 1 query regardless of size. What grows is the volume of data transferred, not the number of round-trips.
+
+> **Test:** `VolumetryComparisonTest.departmentCollectionVolumetry()`
+
+### N departments x 5 items/collection -- horizontal scaling
+
+| Departments | Without batch | With batch=16 | Total items |
+|---:|---:|---:|---:|
+| 1 | 8 | 8 | 30 |
+| 5 | 32 | 8 | 150 |
+| 10 | 62 | 8 | 300 |
+| 25 | 152 | 14 | 750 |
+
+**From 152 to 14 queries for 25 departments -- 91% reduction.** Without batch, the growth is `1 + N*7` (region + 6 collections). With batch=16, it stays constant up to 16 departments and increases minimally after that.
+
+> **Test:** `VolumetryComparisonTest.multipleDepartmentsVolumetry()` + `VolumetryBatchFetchTest.departmentBatchVolumetry()`
+
+### N departments x 5 items/col -- large scale (25 -> 5K)
+
+| Depts | @Transactional (no batch) | With batch=16 | Reduction |
+|---:|---:|---:|---:|
+| 25 | 152 | 14 | 11x |
+| 100 | 602 | 44 | 14x |
+| 500 | 3,002 | 194 | 16x |
+| 1,000 | 6,002 | 380 | 16x |
+| 5,000 | 30,002 | 1,880 | 16x |
+
+Without batch: `1 + 7N` (linear formula). With batch=16: `1 + ceil(N/16)*7` (~16x constant reduction).
+
+At 5,000 departments without batch: **30,002 queries in 64 seconds**. With batch: **1,880 queries in 8 seconds**. An 8x factor in wall-clock time.
+
+> **Test:** `LargeScaleDepartmentTest` + `LargeScaleDepartmentBatchTest`
+
+### Split Queries vs DTO Projection -- scaling items per collection
+
+| Items/col | Split Queries | DTO Projection | Total items |
+|---:|---:|---:|---:|
+| 5 | 7 queries, 75ms | 7 queries, 64ms | 30 |
+| 50 | 7 queries, 16ms | 7 queries, 10ms | 300 |
+| 500 | 7 queries, 42ms | 7 queries, 11ms | 3,000 |
+| 5,000 | 7 queries, 114ms | 7 queries, 60ms | 30,000 |
+
+Both produce **7 constant queries** regardless of collection size. DTO Projection is slightly faster because it does not load entities into the persistence context.
+
+> **Test:** `LargeScaleDepartmentTest.splitQueriesCollectionScale()` + `LargeScaleDepartmentTest.dtoProjectionCollectionScale()`
+
+---
+
+## Writes: what OSIV hides in modification operations
+
+The previous sections focus on reads, but OSIV affects writes in different and more dangerous ways.
+
+### Over-fetching: loading more data than needed
+
+When you use `@EntityGraph` or `JOIN FETCH` to resolve a `LazyInitializationException`, you load the complete entity with ALL its columns + the full relationships -- even if you only need 2 fields. With 10K stores:
+
+| Strategy | Columns transferred | Entities in memory |
+|---|---|---|
+| `@EntityGraph` (full entity) | id, name, address + ALL cols from type, region, tz | 10K Store + types + regions + tz |
+| DTO Projection (6 fields) | s.id, s.name, s.address, st.name, r.name, tz.zoneId | 0 (records only) |
+| Minimal projection (2 fields) | s.name, r.name | 0 |
+
+All three issue **1 SQL query**, but the amount of data transferred and memory consumption are radically different. This matters especially on high-traffic endpoints.
+
+> **Test:** `OverFetchingTest` -- 3 tests comparing the same dataset with @EntityGraph, DTO Projection, and minimal 2-column projection.
+
+### Cascade persist: the cost of saving complete graphs
+
+Saving a `Department` with 6 collections via `CascadeType.ALL` generates `2 + 6N` statements (1 region + 1 dept + N items per collection):
+
+| Items/col | Statements | Time | Total items |
+|---:|---:|---:|---:|
+| 10 | 62 | 38ms | 60 |
+| 50 | 302 | 155ms | 300 |
+| 100 | 602 | 305ms | 600 |
+| 500 | 3,002 | 1,487ms | 3,000 |
+
+> **Test:** `CascadePersistTest` -- measures statements and time with and without `jdbc.batch_size`.
+
+### jdbc.batch_size does NOT work with IDENTITY generation
+
+A lab finding: configuring `hibernate.jdbc.batch_size=50` **does not reduce the number of statements** when using `@GeneratedValue(strategy = GenerationType.IDENTITY)` (the default in PostgreSQL with auto-increment). Hibernate needs the generated ID back immediately after each INSERT, which prevents grouping multiple INSERTs into a single JDBC batch.
+
+| Volume | Without batch | With batch=50 |
+|---:|---:|---:|
+| 100 orders | 100 stmts, 143ms | 100 stmts, 92ms |
+| 1K orders | 1,000 stmts, 1s | 1,000 stmts, 934ms |
+| 5K orders | 5,000 stmts, 4.8s | 5,000 stmts, 4.5s |
+
+**Statements identical.** For `jdbc.batch_size` to work, you need `GenerationType.SEQUENCE` with `@SequenceGenerator(allocationSize = 50)`. This allows Hibernate to pre-allocate IDs in blocks and batch the INSERTs.
+
+> **Test:** `BulkInsertTest` -- compares bulk insert with and without batch, confirming that IDENTITY prevents batching.
+
+### Optimistic locking and OSIV
+
+With `@Version` on the entity, Hibernate detects concurrent modifications. Without OSIV, detection is **early** -- inside the `@Transactional` where you can handle the error. With OSIV, detection can be **late** -- at the end of the request when the automatic flush tries to persist the stale entity, where you can no longer do a clean rollback.
+
+> **Test:** `OptimisticLockingTest` -- simulates two users modifying the same `Order`. The second receives `StaleObjectStateException`.
+
+### Accidental dirty checking (the password bug)
+
+Without OSIV, if you modify an entity without calling `save()`, the change is silently lost (the entity is detached). With OSIV, the dirty checking at the end of the request detects the modification and persists it -- which seems "correct" but masks the lack of an explicit `save()`.
+
+> **Test:** `PasswordBugTest` -- with OSIV=true the password is persisted without `save()`. With OSIV=false it is lost. `saveAndFlush()` works in both cases.
+
+---
+
+## Decision tree
+
+```
+0. ALWAYS: configure batch_fetch_size=16 as a global baseline
+   (Test: BatchSizeQueryCountTest -- reduces 31 queries to 4)
+
+1. Is it a WRITE operation?
+   YES --> @Transactional + explicit save()/saveAndFlush()
+           NEVER rely on implicit dirty checking
+           For batch inserts: use GenerationType.SEQUENCE, not IDENTITY
+           (Test: PasswordBugTest -- without save() the change is lost with OSIV=false)
+           (Test: BulkInsertTest -- IDENTITY prevents JDBC batching)
+   NO  --> (it is a read, continue)
+
+2. How many records do you expect to return?
+
+   THOUSANDS OR MORE (>1K) --> pagination or streaming is MANDATORY
+       findAll() with >10K records is a memory time bomb
+       At 1M: all solutions take 3-5s loading into List<>
+       At 10M: ALL fail with OutOfMemoryError (4GB heap)
+       (Test: LargeScaleVolumetryTest -- OOM at 10M, 5.5s at 1M)
+       (Test: TenMillionTest -- OOM confirmed for EntityGraph, DTO, and Transactional)
+
+       Will you paginate with collections?
+         YES --> DO NOT use @EntityGraph (paginates IN MEMORY, no LIMIT/OFFSET)
+                 Use @Transactional(readOnly=true) + batch_fetch
+                 (Test: PaginationTrapTest -- 10 depts loaded to show 3)
+         NO  --> Paginating with ManyToOne works fine with any solution
+
+   HUNDREDS OR FEWER --> findAll() is viable, continue
+
+3. Are the ManyToOne refs shared (catalogs) or unique (1 per entity)?
+
+   SHARED (types, categories, regions)
+       --> N+1 is constant: 7 queries even with 1M records
+           batch_fetch does not help much here (from 7 to 4)
+           (Test: LargeScaleVolumetryTest -- 7 constant queries up to 1M)
+
+   UNIQUE (createdBy, assignedTo, etc.)
+       --> N+1 grows linearly: 3,001 queries for 1K, 30,001 for 10K
+           WITHOUT batch_fetch: impractical beyond 10K (14.7s for 10K)
+           WITH batch_fetch=16: 16x constant reduction (190 queries for 1K)
+           (Test: NPlusOneCardinalityTest -- 7 vs 31)
+           (Test: LargeScaleBatchFetchTest -- 16x reduction up to 100K)
+
+4. Do you need the JPA entity or just flat data?
+
+   JUST DATA --> DTO Projection
+       Store (ManyToOne): 1 query, 0 entities
+       (Test: DtoProjectionTest -- prepared=1, entityFetch=0)
+       Department (collections): 7 queries (1 base + 6 selects), 0 entities
+       (Test: DepartmentDtoProjectionTest -- prepared=7, entityFetch=0)
+       Less over-fetching: only transfers the columns you need
+       (Test: OverFetchingTest -- @EntityGraph loads everything vs DTO only what is needed)
+       At scale: the fastest -- 3.2s for 1M vs 5.5s for @EntityGraph
+       (Test: LargeScaleVolumetryTest -- DTO vs EntityGraph at 1M)
+
+   NEED ENTITY --> (continue)
+
+5. Does the entity have multiple collections (>1 List/Set)?
+
+   YES --> Split Queries (1 JOIN FETCH per collection, L1 cache merge)
+           7 constant queries from 5 to 5,000 items per collection
+           NEVER @EntityGraph here:
+             - With List: MultipleBagFetchException
+             - With Set: silent cartesian product (5^3 = 125 rows for 15 items)
+           (Test: SplitQueryTest -- 7 queries, 0 cartesian product)
+           (Test: CartesianProductTest -- MultipleBagFetchException with List)
+           (Test: CartesianProductWithSetsTest -- silent cartesian product with Set)
+           (Test: LargeScaleDepartmentTest -- 7 constant queries up to 5K items/col)
+   NO  --> (continue)
+
+6. How many ManyToOne relationships does it have?
+
+   1-3 ManyToOne --> @EntityGraph (1 JOIN query)
+                     Works well up to 1M records (5.5s at 1M)
+                     Beware of over-fetching: loads all columns
+                     (Test: EntityGraphQueryCountTest -- prepared=1)
+                     (Test: LargeScaleVolumetryTest -- 1 query up to 1M)
+                     (Test: OverFetchingTest -- over-fetching vs DTO)
+
+   Many or deep --> @Transactional(readOnly=true) + batch_fetch
+                    (Test: LargeScaleBatchFetchTest -- 16x reduction)
+
+ALWAYS on read methods: @Transactional(readOnly=true)
+  - Disables dirty checking (no accidental flush)
+  - Reduces memory (no state snapshots)
+  (Test: ReadOnlyOptimizationTest -- modifications are not persisted)
+```
+
+---
+
+## Executive summary
+
+### Reads
+
+1. **`batch_fetch_size=16`** as a global baseline (1 line of yml)
+2. **`@EntityGraph`** for simple entities with few ManyToOne relationships, without pagination on collections
+3. **Split Queries** for entities with multiple collections
+4. **DTO Projection** for read-only endpoints, especially high-traffic or large-volume ones
+5. **`readOnly=true`** on all read transactions (less memory, no accidental flush)
+
+### Writes
+
+1. **Always explicit `@Transactional`** -- never rely on OSIV to persist changes
+2. **Always explicit `save()`/`saveAndFlush()`** -- never rely on dirty checking
+3. **`GenerationType.SEQUENCE`** if you need batch inserts -- `IDENTITY` prevents JDBC batching
+4. **`@Version`** for optimistic locking -- without OSIV detection is early and manageable
+
+### Volumetry
+
+- At **>1K records**: pagination is mandatory
+- At **>10K with unique refs without batch**: N+1 becomes impractical
+- At **1M**: all solutions based on `findAll()` take 3-5s
+- At **10M**: `OutOfMemoryError` for all solutions -- you need streaming or pagination
+
+Every number in this document is backed by a passing test. The full code is in the `open-in-view-lab` repository.

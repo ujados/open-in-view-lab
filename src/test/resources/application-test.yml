@@ -1,0 +1,24 @@
+spring:
+  jpa:
+    open-in-view: true
+    hibernate:
+      ddl-auto: create-drop
+    properties:
+      hibernate:
+        generate_statistics: true
+    show-sql: false
+
+  datasource:
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 3000
+
+  threads:
+    virtual:
+      enabled: true
+
+logging:
+  level:
+    org.hibernate.stat: WARN
+    org.hibernate.SQL: WARN

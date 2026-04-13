@@ -1,0 +1,15 @@
+spring:
+  jpa:
+    open-in-view: false
+    show-sql: false
+    properties:
+      hibernate:
+        generate_statistics: true
+        default_batch_fetch_size: 16
+
+logging:
+  level:
+    org.hibernate.stat: WARN
+    org.hibernate.SQL: OFF
+    org.hibernate.orm.jdbc.bind: OFF
+    org.hibernate.orm.jdbc: OFF

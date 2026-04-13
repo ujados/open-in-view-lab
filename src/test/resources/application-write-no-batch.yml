@@ -1,0 +1,12 @@
+spring:
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        generate_statistics: true
+
+logging:
+  level:
+    org.hibernate.stat: WARN
+    org.hibernate.SQL: OFF
+    org.hibernate.orm.jdbc.bind: OFF

@@ -1,0 +1,8 @@
+spring:
+  jpa:
+    open-in-view: true
+  datasource:
+    hikari:
+      maximum-pool-size: 2
+      minimum-idle: 1
+      connection-timeout: 2000

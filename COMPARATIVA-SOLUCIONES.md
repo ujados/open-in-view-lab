@@ -10,15 +10,21 @@ A continuacion presento cinco estrategias, medidas con Hibernate Statistics sobr
 
 ## Tabla resumen
 
-| Solucion | Queries (10 Store, 3 ManyToOne) | Queries (1 Dept, 6 colecciones x5) | Producto cartesiano? | Esfuerzo |
-|---|:---:|:---:|:---:|---|
-| `@EntityGraph` | **1** | `MultipleBagFetchException` | Si | Anotacion en repository |
-| `@Transactional(readOnly=true)` | 7 o 31 (*) | 8 | No | Anotacion en servicio |
-| `batch_fetch_size=16` | **4** | 8 | No | 1 linea en `application.yml` |
-| Split Queries | n/a (ManyToOne no necesita split) | **7** | No | Codigo manual |
-| DTO Projection | **1** | **7** | No | Query JPQL + record/DTO |
+| Solucion | Queries (10 Store, 3 ManyToOne) | Queries (1 Dept, 6 colecciones x5) | Cartesiano? | Memoria (100K) | Esfuerzo |
+|---|:---:|:---:|:---:|:---:|---|
+| `@EntityGraph` | **1** | `MultipleBagFetchException` | Si | 117 MB | Anotacion en repository |
+| `@Transactional(readOnly=true)` | 7 o 31 (*) | 8 | No | ~117 MB | Anotacion en servicio |
+| `batch_fetch_size=16` | **4** | 8 | No | ~117 MB | 1 linea en `application.yml` |
+| `Hibernate.initialize()` | 7 | 8 | No | ~117 MB | Codigo manual explicito |
+| Split Queries | n/a | **7** | No | ~117 MB | Codigo manual |
+| DTO Projection (JPQL) | **1** | **7** | No | 56 MB | Query JPQL + record |
+| Interface Projection | **1** | n/a | No | 56 MB | Interface + @Query |
+| JdbcClient | **1** | **7** | No | 56 MB | SQL manual |
+| StatelessSession | n/a (escritura) | n/a | No | ~0 | API Hibernate directa |
 
-> (*) 7 queries cuando las 10 stores comparten 2 references de cada tipo. **31 queries** cuando cada store tiene referencias unicas. El N+1 depende de la cardinalidad de las entidades referenciadas, no del numero de entidades padre. Test: `NPlusOneCardinalityTest`.
+> (*) 7 queries cuando las 10 stores comparten 2 references de cada tipo. **31 queries** cuando cada store tiene referencias unicas. El N+1 depende de la cardinalidad de las entidades referenciadas, no del numero de entidades padre.
+>
+> La columna "Memoria (100K)" viene del test `MemoryFootprintTest`: @EntityGraph carga **117 MB** de entidades + snapshots, DTO/JDBC solo **56 MB** de records planos. 2x diferencia.
 
 ---
 
@@ -68,6 +74,12 @@ Con 100K registros esto mata la aplicacion sin aviso.
 | | No escala a grafos complejos |
 
 **Cuando usarlo:** entidades con **1-2 relaciones `ManyToOne`** o **una unica coleccion sin paginacion**. El caso clasico: `Product` con su `Category`, `Store` con `StoreType`/`Region`/`Timezone`.
+
+### El caso feliz: ManyToOne + 1 coleccion
+
+No todo son problemas con `@EntityGraph`. Con 3 `ManyToOne` + 1 sola coleccion (`storeEmployees`), funciona perfectamente: **1 query, sin cartesiano, sin excepcion**.
+
+> **Test:** `EntityGraphHappyPathTest` — `findAllWithRelationsAndEmployeesBy()` devuelve 5 stores con todas sus relaciones en 1 query.
 
 ---
 
@@ -246,6 +258,88 @@ Las 7 queries son identicas en cantidad a Split Queries, pero sin cargar entidad
 | Compatible con paginacion real | No hay dirty checking (ventaja y limitacion) |
 
 **Cuando usarlo:** endpoints de **solo lectura** que no necesitan la entidad para modificarla despues. Listados, reportes, vistas de detalle sin edicion, endpoints de alto trafico.
+
+---
+
+## 6. Interface Projection
+
+```java
+public interface StoreView {
+    Long getId();
+    String getName();
+    String getAddress();
+    String getStoreTypeName();
+    String getRegionName();
+    String getTimezoneZoneId();
+}
+
+// En el repository:
+@Query("SELECT s.id AS id, s.name AS name, s.address AS address, " +
+       "st.name AS storeTypeName, r.name AS regionName, tz.zoneId AS timezoneZoneId " +
+       "FROM Store s LEFT JOIN s.storeType st LEFT JOIN s.region r LEFT JOIN s.timezone tz")
+List<StoreView> findAllProjectedBy();
+```
+
+Misma idea que DTO Projection pero con menos boilerplate: declaras una interfaz con getters y Spring Data genera la implementacion. **1 query, 0 entidades, 56 MB** para 100K registros — identico al constructor DTO en rendimiento.
+
+> **Test:** `InterfaceProjectionTest` — `prepared=1, entityFetch=0, queryExec=1`.
+
+| Pros | Contras |
+|---|---|
+| Menos boilerplate que constructor DTO | Requiere `@Query` con aliases |
+| Spring Data genera la implementacion | No funciona para colecciones (solo plano) |
+| Misma eficiencia que DTO Projection | Menos control que un record explicito |
+
+**Cuando usarlo:** cuando DTO Projection es la solucion correcta pero quieres menos codigo. Ideal para endpoints de lectura simples.
+
+---
+
+## 7. `Hibernate.initialize()`
+
+```java
+@Transactional(readOnly = true)
+public List<StoreDto> getAllStoresWithInitialize() {
+    List<Store> stores = storeRepository.findAll();
+    stores.forEach(store -> {
+        Hibernate.initialize(store.getStoreType());
+        Hibernate.initialize(store.getRegion());
+        Hibernate.initialize(store.getTimezone());
+    });
+    return stores.stream().map(storeMapper::toDto).toList();
+}
+```
+
+Control explicito sobre que relaciones se cargan y cuando. Genera las mismas queries que `@Transactional` (N+1), pero el codigo deja claro que la carga es intencional. No hay "magia" — si una relacion se carga, es porque tu la pediste.
+
+Para 10 stores: **7 queries** (vs 1 de @EntityGraph).
+
+> **Test:** `HibernateInitializeTest` — `Hibernate.initialize()` 7 queries vs `@EntityGraph` 1 query.
+
+| Pros | Contras |
+|---|---|
+| Control explicito de que se carga | Mismo N+1 que @Transactional |
+| Codigo autodocumentado | Mas verboso |
+| Funciona con cualquier relacion | No reduce queries |
+
+**Cuando usarlo:** cuando necesitas que el codigo sea **explicito** sobre que relaciones se cargan. Util en servicios complejos donde `@EntityGraph` no es suficiente y quieres que otro desarrollador entienda que datos se estan cargando.
+
+---
+
+## 8. Memoria: el coste oculto del persistence context
+
+Con 100K stores, el test `MemoryFootprintTest` midio:
+
+| Solucion | Memoria | Por que |
+|---|---:|---|
+| `@EntityGraph` | **117 MB** | Entidades managed + snapshots para dirty checking |
+| DTO Projection | **56 MB** | Solo records planos, sin persistence context |
+| JdbcClient | **56 MB** | Solo records planos, sin Hibernate |
+
+@EntityGraph consume **2x mas memoria** que DTO/JDBC para los mismos datos. El overhead viene de: (1) la entidad Java managed en el persistence context, (2) una copia snapshot de cada campo para dirty checking, (3) metadata de asociaciones y proxies.
+
+A 100K registros, la diferencia es 61 MB. A 1M seria ~600 MB de overhead solo por usar entidades en vez de DTOs. Este es el motivo por el que `findAll()` con entidades explota con OOM mucho antes que con DTO Projection.
+
+> **Test:** `MemoryFootprintTest` — mide heap antes/despues de cargar 100K stores con cada solucion.
 
 ---
 
@@ -436,6 +530,30 @@ Un descubrimiento del laboratorio: configurar `hibernate.jdbc.batch_size=50` **n
 **Statements identicos.** Para que `jdbc.batch_size` funcione, necesitas `GenerationType.SEQUENCE` con `@SequenceGenerator(allocationSize = 50)`. Esto permite que Hibernate pre-aloque IDs en bloques y agrupe los INSERTs.
 
 > **Test:** `BulkInsertTest` — compara bulk insert con y sin batch, confirmando que IDENTITY impide el batching.
+
+### StatelessSession: escritura sin persistence context
+
+Para bulk inserts donde no necesitas dirty checking ni cascade, `StatelessSession` elimina el overhead del persistence context por completo:
+
+```java
+try (StatelessSession session = sessionFactory.openStatelessSession()) {
+    session.beginTransaction();
+    for (int i = 0; i < count; i++) {
+        session.insert(order);
+    }
+    session.getTransaction().commit();
+}
+```
+
+| Volumen | StatelessSession | Session (con PC) |
+|---:|---:|---:|
+| 100 | 130ms | 185ms |
+| 1K | 1,103ms | 1,130ms |
+| 5K | 5,220ms | 5,100ms |
+
+Con `GenerationType.IDENTITY`, la diferencia es minima porque el bottleneck es el round-trip por cada INSERT (1 por cada ID generado). StatelessSession brilla mas con `GenerationType.SEQUENCE` donde puede pre-alocar IDs y agrupar inserts.
+
+> **Test:** `StatelessSessionTest` — StatelessSession vs Session con flush+clear cada 50 entidades.
 
 ### Optimistic locking y OSIV
 

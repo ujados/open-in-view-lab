@@ -835,26 +835,37 @@ SIEMPRE en metodos de lectura: @Transactional(readOnly=true)
 
 ## Resumen ejecutivo
 
-### Lectura
+### Lectura — la combinacion ganadora
 
-1. **`batch_fetch_size=16`** como baseline global (1 linea de yml)
-2. **`@EntityGraph`** para entidades simples con pocas relaciones ManyToOne, sin paginacion sobre colecciones
-3. **Split Queries** para entidades con multiples colecciones
-4. **DTO Projection** para endpoints de solo lectura, especialmente de alto trafico o volumenes grandes
-5. **`readOnly=true`** en todas las transacciones de lectura (menos memoria, sin flush accidental)
+1. **`batch_fetch_size=16`** como baseline global (1 linea de yml — mejora todo)
+2. **`@Fetch(FetchMode.SUBSELECT)`** para colecciones cuando cargas muchos padres (7 queries constantes sin importar N)
+3. **Split Queries** para 1 entidad con multiples colecciones
+4. **`@EntityGraph`** para entidades simples con 1-3 ManyToOne (1 query, pero 117 MB vs 56 MB a 100K)
+5. **DTO Projection** o **Interface Projection** para solo lectura (56 MB, la mas rapida a escala)
+6. **JdbcClient** cuando no necesitas JPA (2-18x mas rapido que @EntityGraph)
+7. **`@Immutable`** para entidades de solo lectura (sin dirty checking, sin snapshots)
+8. **`readOnly=true`** siempre en transacciones de lectura (menos memoria, sin flush accidental)
 
 ### Escritura
 
 1. **Siempre `@Transactional` explicito** — nunca depender de OSIV para persistir cambios
 2. **Siempre `save()`/`saveAndFlush()` explicito** — nunca depender del dirty checking
 3. **`GenerationType.SEQUENCE`** si necesitas batch inserts — `IDENTITY` impide el batching JDBC
-4. **`@Version`** para optimistic locking — sin OSIV la deteccion es temprana y manejable
+4. **`StatelessSession`** para bulk writes sin persistence context
+5. **`@Version`** para optimistic locking — sin OSIV la deteccion es temprana y manejable
 
 ### Volumetria
 
 - A **>1K registros**: paginar es obligatorio
 - A **>10K con refs unicas sin batch**: N+1 se vuelve impracticable
-- A **1M**: todas las soluciones basadas en `findAll()` tardan 3-5s
+- A **1M**: todas las soluciones basadas en `findAll()` tardan 3-5s. @EntityGraph 117 MB vs DTO 56 MB
 - A **10M**: `OutOfMemoryError` para todas las soluciones — necesitas streaming o paginacion
+- **`@Fetch(SUBSELECT)`**: 7 queries constantes desde 5 hasta 100+ departamentos
+
+### Cuando NO necesitas JPA
+
+- Lectura pura con alto trafico → **JdbcClient** (2-18x mas rapido)
+- Reportes y agregaciones → SQL nativo
+- Bulk writes → **StatelessSession** o SQL nativo con `generate_series`
 
 Cada numero de este documento esta respaldado por un test que pasa en verde. El codigo completo esta en el repositorio `open-in-view-lab`.

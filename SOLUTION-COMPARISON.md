@@ -10,15 +10,24 @@ Below I present five strategies, measured with Hibernate Statistics on a real Po
 
 ## Summary table
 
-| Solution | Queries (10 Store, 3 ManyToOne) | Queries (1 Dept, 6 collections x5) | Cartesian product? | Effort |
-|---|:---:|:---:|:---:|---|
-| `@EntityGraph` | **1** | `MultipleBagFetchException` | Yes | Annotation on repository |
-| `@Transactional(readOnly=true)` | 7 or 31 (*) | 8 | No | Annotation on service |
-| `batch_fetch_size=16` | **4** | 8 | No | 1 line in `application.yml` |
-| Split Queries | n/a (ManyToOne does not need split) | **7** | No | Manual code |
-| DTO Projection | **1** | **7** | No | JPQL query + record/DTO |
+| Solution | Queries (10 Store, 3 ManyToOne) | Queries (1 Dept, 6 collections x5) | Cartesian? | Memory (100K) | Effort |
+|---|:---:|:---:|:---:|:---:|---|
+| `@EntityGraph` | **1** | `MultipleBagFetchException` | Yes | 117 MB | Annotation on repository |
+| `@Transactional(readOnly=true)` | 7 or 31 (*) | 8 | No | ~117 MB | Annotation on service |
+| `batch_fetch_size=16` | **4** | 8 | No | ~117 MB | 1 line in `application.yml` |
+| `@BatchSize(16)` per collection | n/a | 13 (25 depts) | No | ~117 MB | Annotation per collection |
+| `@Fetch(SUBSELECT)` | n/a | **7** (25 depts) | No | ~117 MB | Annotation per collection |
+| `Hibernate.initialize()` | 7 | 8 | No | ~117 MB | Explicit manual code |
+| Split Queries | n/a | **7** | No | ~117 MB | Manual code |
+| DTO Projection (JPQL) | **1** | **7** | No | 56 MB | JPQL query + record |
+| Interface Projection | **1** | n/a | No | 56 MB | Interface + @Query |
+| JdbcClient | **1** | **7** | No | 56 MB | Manual SQL |
+| `@Immutable` | n/a | n/a (read-only) | No | <117 MB | Annotation on entity |
+| StatelessSession | n/a (writes) | n/a | No | ~0 | Hibernate API directly |
 
-> (*) 7 queries when the 10 stores share 2 references of each type. **31 queries** when each store has unique references. The N+1 depends on the cardinality of the referenced entities, not the number of parent entities. Test: `NPlusOneCardinalityTest`.
+> (*) 7 queries when the 10 stores share 2 references of each type. **31 queries** when each store has unique references. The N+1 depends on the cardinality of the referenced entities, not the number of parent entities.
+>
+> The "Memory (100K)" column comes from `MemoryFootprintTest`: @EntityGraph loads **117 MB** of entities + snapshots, DTO/JDBC only **56 MB** of flat records. 2x difference.
 
 ---
 
@@ -332,6 +341,88 @@ The 7 queries are identical in count to Split Queries, but without loading entit
 | Compatible with real pagination | No dirty checking (both an advantage and a limitation) |
 
 **When to use:** **read-only** endpoints that do not need the entity for later modification. Listings, reports, detail views without editing, high-traffic endpoints.
+
+---
+
+## 6. Interface Projection
+
+```java
+public interface StoreView {
+    Long getId();
+    String getName();
+    String getAddress();
+    String getStoreTypeName();
+    String getRegionName();
+    String getTimezoneZoneId();
+}
+
+// In the repository:
+@Query("SELECT s.id AS id, s.name AS name, s.address AS address, " +
+       "st.name AS storeTypeName, r.name AS regionName, tz.zoneId AS timezoneZoneId " +
+       "FROM Store s LEFT JOIN s.storeType st LEFT JOIN s.region r LEFT JOIN s.timezone tz")
+List<StoreView> findAllProjectedBy();
+```
+
+Same idea as DTO Projection but with less boilerplate: you declare an interface with getters and Spring Data generates the implementation. **1 query, 0 entities, 56 MB** for 100K records -- identical to the constructor DTO in performance.
+
+> **Test:** `InterfaceProjectionTest` -- `prepared=1, entityFetch=0, queryExec=1`.
+
+| Pros | Cons |
+|---|---|
+| Less boilerplate than constructor DTO | Requires `@Query` with aliases |
+| Spring Data generates the implementation | Does not work for collections (flat only) |
+| Same efficiency as DTO Projection | Less control than an explicit record |
+
+**When to use:** when DTO Projection is the right solution but you want less code. Ideal for simple read endpoints.
+
+---
+
+## 7. `Hibernate.initialize()`
+
+```java
+@Transactional(readOnly = true)
+public List<StoreDto> getAllStoresWithInitialize() {
+    List<Store> stores = storeRepository.findAll();
+    stores.forEach(store -> {
+        Hibernate.initialize(store.getStoreType());
+        Hibernate.initialize(store.getRegion());
+        Hibernate.initialize(store.getTimezone());
+    });
+    return stores.stream().map(storeMapper::toDto).toList();
+}
+```
+
+Explicit control over which relationships are loaded and when. It generates the same queries as `@Transactional` (N+1), but the code makes it clear that the loading is intentional. There is no "magic" -- if a relationship is loaded, it is because you asked for it.
+
+For 10 stores: **7 queries** (vs 1 from @EntityGraph).
+
+> **Test:** `HibernateInitializeTest` -- `Hibernate.initialize()` 7 queries vs `@EntityGraph` 1 query.
+
+| Pros | Cons |
+|---|---|
+| Explicit control over what gets loaded | Same N+1 as @Transactional |
+| Self-documenting code | More verbose |
+| Works with any relationship | Does not reduce queries |
+
+**When to use:** when you need the code to be **explicit** about which relationships are loaded. Useful in complex services where `@EntityGraph` is not sufficient and you want another developer to understand what data is being loaded.
+
+---
+
+## 8. Memory: the hidden cost of the persistence context
+
+With 100K stores, the `MemoryFootprintTest` test measured:
+
+| Solution | Memory | Why |
+|---|---:|---|
+| `@EntityGraph` | **117 MB** | Managed entities + snapshots for dirty checking |
+| DTO Projection | **56 MB** | Plain records only, no persistence context |
+| JdbcClient | **56 MB** | Plain records only, no Hibernate |
+
+@EntityGraph consumes **2x more memory** than DTO/JDBC for the same data. The overhead comes from: (1) the managed Java entity in the persistence context, (2) a snapshot copy of each field for dirty checking, (3) association and proxy metadata.
+
+At 100K records, the difference is 61 MB. At 1M it would be ~600 MB of overhead just from using entities instead of DTOs. This is why `findAll()` with entities runs into OOM much sooner than with DTO Projection.
+
+> **Test:** `MemoryFootprintTest` -- measures heap before/after loading 100K stores with each solution.
 
 ---
 
@@ -717,26 +808,37 @@ ALWAYS on read methods: @Transactional(readOnly=true)
 
 ## Executive summary
 
-### Reads
+### Reads -- the winning combination
 
-1. **`batch_fetch_size=16`** as a global baseline (1 line of yml)
-2. **`@EntityGraph`** for simple entities with few ManyToOne relationships, without pagination on collections
-3. **Split Queries** for entities with multiple collections
-4. **DTO Projection** for read-only endpoints, especially high-traffic or large-volume ones
-5. **`readOnly=true`** on all read transactions (less memory, no accidental flush)
+1. **`batch_fetch_size=16`** as a global baseline (1 line of yml -- improves everything)
+2. **`@Fetch(FetchMode.SUBSELECT)`** for collections when loading many parents (7 constant queries regardless of N)
+3. **Split Queries** for a single entity with multiple collections
+4. **`@EntityGraph`** for simple entities with 1-3 ManyToOne (1 query, but 117 MB vs 56 MB at 100K)
+5. **DTO Projection** or **Interface Projection** for read-only endpoints (56 MB, fastest at scale)
+6. **JdbcClient** when you don't need JPA (2-18x faster than @EntityGraph)
+7. **`@Immutable`** for read-only entities (no dirty checking, no snapshots)
+8. **`readOnly=true`** always on read transactions (less memory, no accidental flush)
 
 ### Writes
 
 1. **Always explicit `@Transactional`** -- never rely on OSIV to persist changes
 2. **Always explicit `save()`/`saveAndFlush()`** -- never rely on dirty checking
 3. **`GenerationType.SEQUENCE`** if you need batch inserts -- `IDENTITY` prevents JDBC batching
-4. **`@Version`** for optimistic locking -- without OSIV detection is early and manageable
+4. **`StatelessSession`** for bulk writes without persistence context
+5. **`@Version`** for optimistic locking -- without OSIV detection is early and manageable
 
 ### Volumetry
 
 - At **>1K records**: pagination is mandatory
 - At **>10K with unique refs without batch**: N+1 becomes impractical
-- At **1M**: all solutions based on `findAll()` take 3-5s
+- At **1M**: all solutions based on `findAll()` take 3-5s. @EntityGraph 117 MB vs DTO 56 MB
 - At **10M**: `OutOfMemoryError` for all solutions -- you need streaming or pagination
+- **`@Fetch(SUBSELECT)`**: 7 constant queries from 5 to 100+ departments
+
+### When you DON'T need JPA
+
+- Pure reads with high traffic --> **JdbcClient** (2-18x faster)
+- Reports and aggregations --> native SQL
+- Bulk writes --> **StatelessSession** or native SQL with `generate_series`
 
 Every number in this document is backed by a passing test. The full code is in the `open-in-view-lab` repository.

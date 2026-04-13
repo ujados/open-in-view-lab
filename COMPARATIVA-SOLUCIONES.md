@@ -18,13 +18,13 @@ A continuacion presento cinco estrategias, medidas con Hibernate Statistics sobr
 | `Hibernate.initialize()` | 7 | 8 | No | ~117 MB | Codigo manual explicito |
 | Split Queries | n/a | **7** | No | ~117 MB | Codigo manual |
 | DTO Projection (JPQL) | **1** | **7** | No | 56 MB | Query JPQL + record |
-| Interface Projection | **1** | n/a | No | 56 MB | Interface + @Query |
+| Interface Projection | **1** | n/a | No | 130 MB | Interface + @Query |
 | JdbcClient | **1** | **7** | No | 56 MB | SQL manual |
 | StatelessSession | n/a (escritura) | n/a | No | ~0 | API Hibernate directa |
 
 > (*) 7 queries cuando las 10 stores comparten 2 references de cada tipo. **31 queries** cuando cada store tiene referencias unicas. El N+1 depende de la cardinalidad de las entidades referenciadas, no del numero de entidades padre.
 >
-> La columna "Memoria (100K)" viene del test `MemoryFootprintTest`: @EntityGraph carga **117 MB** de entidades + snapshots, DTO/JDBC solo **56 MB** de records planos. 2x diferencia.
+> La columna "Memoria (100K)" viene de `MemoryFootprintTest` + `LargeScaleAllSolutionsTest`: @EntityGraph carga **118 MB** de entidades + snapshots, DTO solo **59 MB** de records planos. Interface Projection sorprende con **130 MB** (proxies dinamicos mas pesados que entidades managed).
 
 ---
 
@@ -366,7 +366,7 @@ public interface StoreView {
 List<StoreView> findAllProjectedBy();
 ```
 
-Misma idea que DTO Projection pero con menos boilerplate: declaras una interfaz con getters y Spring Data genera la implementacion. **1 query, 0 entidades, 56 MB** para 100K registros — identico al constructor DTO en rendimiento.
+Misma idea que DTO Projection pero con menos boilerplate: declaras una interfaz con getters y Spring Data genera la implementacion. **1 query, 0 entidades**, pero **130 MB** para 100K registros — sorprendentemente mas pesado que @EntityGraph (118 MB). Los proxies dinamicos de Spring Data (`java.lang.reflect.Proxy`) mantienen un `Map<String, Object>` por instancia, lo que es mas costoso en memoria que un `record` plano (59 MB con DTO Projection).
 
 > **Test:** `InterfaceProjectionTest` — `prepared=1, entityFetch=0, queryExec=1`.
 
@@ -413,19 +413,24 @@ Para 10 stores: **7 queries** (vs 1 de @EntityGraph).
 
 ## 8. Memoria: el coste oculto del persistence context
 
-Con 100K stores, el test `MemoryFootprintTest` midio:
+Con 100K stores, el test `MemoryFootprintTest` y `LargeScaleAllSolutionsTest` midieron:
 
 | Solucion | Memoria | Por que |
 |---|---:|---|
-| `@EntityGraph` | **117 MB** | Entidades managed + snapshots para dirty checking |
-| DTO Projection | **56 MB** | Solo records planos, sin persistence context |
+| `@EntityGraph` | **118 MB** | Entidades managed + snapshots para dirty checking |
+| `@Transactional` | **108 MB** | Entidades managed + snapshots (similar a EntityGraph) |
+| `initialize()` | **111 MB** | Entidades managed + snapshots (similar a EntityGraph) |
+| Interface Projection | **130 MB** | Proxies dinamicos de Spring Data son pesados |
+| DTO Projection | **59 MB** | Solo records planos, sin persistence context |
 | JdbcClient | **56 MB** | Solo records planos, sin Hibernate |
 
-@EntityGraph consume **2x mas memoria** que DTO/JDBC para los mismos datos. El overhead viene de: (1) la entidad Java managed en el persistence context, (2) una copia snapshot de cada campo para dirty checking, (3) metadata de asociaciones y proxies.
+**Sorpresa: Interface Projection usa MAS memoria que @EntityGraph** (130 MB vs 118 MB). Aunque Interface Projection no carga entidades en el persistence context, Spring Data genera proxies dinamicos para cada fila devuelta. Estos proxies (`java.lang.reflect.Proxy`) mantienen un `Map<String, Object>` interno por cada instancia, lo que resulta mas pesado que un `record` plano. A 100K registros, la diferencia es significativa.
 
-A 100K registros, la diferencia es 61 MB. A 1M seria ~600 MB de overhead solo por usar entidades en vez de DTOs. Este es el motivo por el que `findAll()` con entidades explota con OOM mucho antes que con DTO Projection.
+JdbcClient y DTO Projection son las opciones mas eficientes en memoria: **56-59 MB** frente a 108-130 MB de las alternativas basadas en entidades o proxies. La diferencia es 2x o mas.
 
-> **Test:** `MemoryFootprintTest` — mide heap antes/despues de cargar 100K stores con cada solucion.
+A 100K registros, la diferencia entre EntityGraph y DTO es ~60 MB. A 1M seria ~600 MB de overhead solo por usar entidades en vez de DTOs. Este es el motivo por el que `findAll()` con entidades explota con OOM mucho antes que con DTO Projection.
+
+> **Test:** `MemoryFootprintTest` + `LargeScaleAllSolutionsTest` — mide heap antes/despues de cargar 100K stores con cada solucion.
 
 ---
 
@@ -569,6 +574,67 @@ A 5,000 departamentos sin batch: **30,002 queries en 64 segundos**. Con batch: *
 Ambas son **7 queries constantes** independientemente del tamano de las colecciones. DTO Projection es ligeramente mas rapida porque no carga entidades en el persistence context.
 
 > **Test:** `LargeScaleDepartmentTest.splitQueriesCollectionScale()` + `LargeScaleDepartmentTest.dtoProjectionCollectionScale()`
+
+### Comparativa definitiva: todas las soluciones head-to-head
+
+Los tests `LargeScaleAllSolutionsTest` y `LargeScaleSubselectVsBatchTest` enfrentan todas las soluciones bajo las mismas condiciones, con 100K stores y hasta 5K departamentos.
+
+#### Store (3 ManyToOne, refs compartidas) — 100K registros
+
+| Solucion | Queries | Tiempo | Memoria |
+|---|---:|---:|---:|
+| JdbcClient | 1 | 137ms | 56 MB |
+| DTO Projection | 1 | 127ms | 59 MB |
+| Interface Projection | 1 | 277ms | 130 MB |
+| @Transactional | 7 | 242ms | 108 MB |
+| initialize() | 7 | 273ms | 111 MB |
+| @EntityGraph | 1 | 369ms | 118 MB |
+
+JdbcClient y DTO Projection son practicamente identicos en rendimiento y memoria. Interface Projection sorprende negativamente: aunque hace 1 sola query, consume **130 MB** — mas que @EntityGraph (118 MB) — porque los proxies dinamicos de Spring Data (`java.lang.reflect.Proxy` con `Map<String, Object>`) son mas pesados que los records planos.
+
+> **Test:** `LargeScaleAllSolutionsTest`
+
+#### Department (6 colecciones x 5 items) — escalando departamentos
+
+| Depts | @Transactional | SUBSELECT | Split (1 dept) | DTO Proj (1 dept) |
+|---:|---:|---:|---:|---:|
+| 25 | 152q 139ms | 7q 27ms | 7q 27ms | 7q 29ms |
+| 100 | 602q 351ms | 7q 23ms | 7q 11ms | 7q 8ms |
+| 500 | 3,002q 1,917ms | 7q 66ms | 7q 10ms | 7q 5ms |
+| 1,000 | 6,002q 4,391ms | 7q 92ms | 7q 11ms | 7q 7ms |
+
+SUBSELECT mantiene **7 queries constantes** independientemente del numero de departamentos. A 1,000 departamentos: 7 queries en 92ms vs 6,002 queries en 4.4 segundos — **48x mas rapido**.
+
+> **Test:** `LargeScaleAllSolutionsTest`
+
+#### SUBSELECT vs @BatchSize vs ninguno — la comparativa definitiva de colecciones
+
+| Depts | Sin batch (N+1) | @BatchSize(16) | SUBSELECT |
+|---:|---:|---:|---:|
+| 25 | 152q 96ms | 13q 26ms | 7q 11ms |
+| 100 | 602q 336ms | 43q 49ms | 7q 15ms |
+| 500 | 3,002q 2,121ms | 193q 210ms | 7q 53ms |
+| 1,000 | 6,002q 4,214ms | 379q 436ms | 7q 84ms |
+| 5,000 | 30,002q 45,603ms | 1,879q 3,696ms | 7q 439ms |
+
+A 5,000 departamentos: **SUBSELECT hace 7 queries en 439ms** vs 30,002 queries en 45.6 segundos (sin batch) — **100x mas rapido**. Incluso vs @BatchSize(16), SUBSELECT es 8x mas rapido (439ms vs 3.7s) con 270x menos queries (7 vs 1,879).
+
+SUBSELECT es el **ganador claro** para colecciones a escala. No crece con N, y la diferencia se amplifica dramaticamente a medida que aumenta el numero de padres.
+
+> **Test:** `LargeScaleSubselectVsBatchTest`
+
+#### Memoria a 100K stores — ranking completo
+
+| Solucion | Memoria |
+|---|---:|
+| JdbcClient | 56 MB |
+| DTO Projection | 59 MB |
+| @Transactional | 108 MB |
+| initialize() | 111 MB |
+| @EntityGraph | 118 MB |
+| Interface Projection | 130 MB |
+
+Interface Projection es la **mas pesada en memoria** de todas las soluciones medidas. Los proxies dinamicos de Spring Data son mas costosos que las entidades managed de Hibernate. Si el rendimiento en memoria importa, usa DTO Projection (record) en vez de Interface Projection (proxy).
 
 ---
 
@@ -782,7 +848,7 @@ A 1K registros, el overhead del persistence context (crear entidades managed, sn
        Department (colecciones): 7 queries (1 base + 6 selects), 0 entidades
        (Test: DepartmentDtoProjectionTest — prepared=7, entityFetch=0)
        Menos over-fetching: solo transfiere las columnas que necesitas
-       (Test: OverFetchingTest — @EntityGraph 117 MB vs DTO 56 MB para 100K)
+       (Test: OverFetchingTest — @EntityGraph 118 MB vs DTO 59 MB para 100K)
        Alternativa sin JPA: JdbcClient (2-18x mas rapido que @EntityGraph)
        (Test: JpaVsJdbcTest — misma query, menos overhead)
 
@@ -818,9 +884,9 @@ A 1K registros, el overhead del persistence context (crear entidades managed, sn
 
    1-3 ManyToOne --> @EntityGraph (1 JOIN query)
                      Funciona bien hasta 1M registros (5.5s a 1M)
-                     Cuidado con over-fetching: carga todas las columnas (117 MB vs 56 MB)
+                     Cuidado con over-fetching: carga todas las columnas (118 MB vs 59 MB)
                      (Test: EntityGraphQueryCountTest — prepared=1)
-                     (Test: MemoryFootprintTest — 117 MB vs 56 MB para 100K)
+                     (Test: MemoryFootprintTest + LargeScaleAllSolutionsTest — 118 MB vs 59 MB para 100K)
 
    Muchas o profundas --> @Transactional(readOnly=true) + batch_fetch
                           (Test: LargeScaleBatchFetchTest — 16x reduccion)
@@ -840,8 +906,8 @@ SIEMPRE en metodos de lectura: @Transactional(readOnly=true)
 1. **`batch_fetch_size=16`** como baseline global (1 linea de yml — mejora todo)
 2. **`@Fetch(FetchMode.SUBSELECT)`** para colecciones cuando cargas muchos padres (7 queries constantes sin importar N)
 3. **Split Queries** para 1 entidad con multiples colecciones
-4. **`@EntityGraph`** para entidades simples con 1-3 ManyToOne (1 query, pero 117 MB vs 56 MB a 100K)
-5. **DTO Projection** o **Interface Projection** para solo lectura (56 MB, la mas rapida a escala)
+4. **`@EntityGraph`** para entidades simples con 1-3 ManyToOne (1 query, pero 118 MB vs 59 MB a 100K)
+5. **DTO Projection** para solo lectura (59 MB, la mas rapida a escala). **Interface Projection** es comoda pero usa 130 MB (proxies dinamicos)
 6. **JdbcClient** cuando no necesitas JPA (2-18x mas rapido que @EntityGraph)
 7. **`@Immutable`** para entidades de solo lectura (sin dirty checking, sin snapshots)
 8. **`readOnly=true`** siempre en transacciones de lectura (menos memoria, sin flush accidental)
@@ -858,9 +924,11 @@ SIEMPRE en metodos de lectura: @Transactional(readOnly=true)
 
 - A **>1K registros**: paginar es obligatorio
 - A **>10K con refs unicas sin batch**: N+1 se vuelve impracticable
-- A **1M**: todas las soluciones basadas en `findAll()` tardan 3-5s. @EntityGraph 117 MB vs DTO 56 MB
+- A **1M**: todas las soluciones basadas en `findAll()` tardan 3-5s. @EntityGraph 118 MB vs DTO 59 MB
 - A **10M**: `OutOfMemoryError` para todas las soluciones — necesitas streaming o paginacion
-- **`@Fetch(SUBSELECT)`**: 7 queries constantes desde 5 hasta 100+ departamentos
+- **`@Fetch(SUBSELECT)`**: 7 queries constantes desde 5 hasta 5,000 departamentos (100x mas rapido que N+1 a 5K depts)
+- **Interface Projection**: 130 MB a 100K — mas pesada que @EntityGraph (118 MB) por proxies dinamicos
+- **SUBSELECT vs @BatchSize(16) a 5K depts**: 7q/439ms vs 1,879q/3.7s — SUBSELECT gana por 8x
 
 ### Cuando NO necesitas JPA
 

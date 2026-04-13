@@ -909,4 +909,27 @@ ALWAYS on read methods: @Transactional(readOnly=true)
 - Reports and aggregations --> native SQL
 - Bulk writes --> **StatelessSession** or native SQL with `generate_series`
 
-Every number in this document is backed by a passing test. The full code is in the `open-in-view-lab` repository.
+Every number in this document is backed by a passing test. Benchmarks use 2 warmup runs + 5 measured executions with median. The full code is in the `open-in-view-lab` repository.
+
+---
+
+## Benchmark limitations
+
+The numbers in this lab are useful for comparing solutions against each other, but they are not directly extrapolable to production. The following limitations bias the results:
+
+| Limitation | Impact on results |
+|---|---|
+| **Single-threaded** | All tests run on 1 thread. In production, N concurrent threads compete for pool connections. Real-world times will be worse, and solutions that hold connections longer (@Transactional, @EntityGraph) suffer more |
+| **No custom indexes** | Tables only have PKs and automatic FK indexes. In production, well-designed indexes can drastically reduce JOIN and WHERE times. This lab represents worst-case |
+| **Synthetic uniform data** | `generate_series` produces perfectly distributed data. In production there is skew (some departments with 5 employees, others with 5,000). This especially affects batch_fetch and SUBSELECT |
+| **PostgreSQL 16 only** | Results change with other engines. MySQL does not support SUBSELECT the same way. Oracle has different batch fetching optimizations. Query counts are universal, but times are PostgreSQL-specific |
+| **Testcontainers (Docker)** | The DB runs in a local Docker container. Network latency = 0. In production, network latency amplifies the difference between 1 query and 30,000 queries |
+| **No L2 cache** | No second-level cache configured (Ehcache, Caffeine). With L2 cache, batch_fetch and @Transactional can be much faster because referenced entities are already cached. @EntityGraph and DTO Projection bypass L2 cache |
+| **JVM cold start in some tests** | Although benchmarks use warmup, volumetry tests don't — their times include JIT compilation. Benchmarks (BenchmarkStoreTest, BenchmarkDepartmentTest) are more reliable |
+| **Fixed heap (2GB)** | Tests run with -Xmx2g. With more heap, 10M tests might not OOM. With less, the threshold drops |
+
+**What IS reliable in these results:**
+- **Query counts** are exact and environment-independent
+- **Scaling formulas** (1+7N, 1+ceil(N/16)*7, constant 7) are universal
+- **Memory ratios** between solutions (2x between entities and DTOs) hold
+- **Failures** (MultipleBagFetchException, OOM, in-memory pagination) are reproducible in any environment

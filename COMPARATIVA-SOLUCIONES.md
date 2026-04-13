@@ -936,4 +936,27 @@ SIEMPRE en metodos de lectura: @Transactional(readOnly=true)
 - Reportes y agregaciones → SQL nativo
 - Bulk writes → **StatelessSession** o SQL nativo con `generate_series`
 
-Cada numero de este documento esta respaldado por un test que pasa en verde. El codigo completo esta en el repositorio `open-in-view-lab`.
+Cada numero de este documento esta respaldado por un test que pasa en verde. Los benchmarks usan 2 warmup runs + 5 ejecuciones medidas con mediana. El codigo completo esta en el repositorio `open-in-view-lab`.
+
+---
+
+## Limitaciones de este benchmark
+
+Los numeros de este laboratorio son utiles para comparar soluciones entre si, pero no son extrapolables directamente a produccion. Las siguientes limitaciones sesgan los resultados:
+
+| Limitacion | Impacto en los resultados |
+|---|---|
+| **Single-thread** | Todos los tests corren en 1 hilo. En produccion hay N threads concurrentes peleando por conexiones del pool. Los tiempos reales seran peores y las soluciones que retienen conexiones mas tiempo (@Transactional, @EntityGraph) penalizan mas |
+| **Sin indices custom** | Las tablas solo tienen PKs e indices de FK automaticos. En produccion, indices bien diseñados pueden reducir drasticamente los tiempos de JOIN y WHERE. Los resultados de este lab son worst-case |
+| **Datos sinteticos uniformes** | `generate_series` produce datos perfectamente distribuidos. En produccion hay skew (unos departamentos con 5 empleados, otros con 5,000). Esto afecta especialmente a batch_fetch y SUBSELECT |
+| **Solo PostgreSQL 16** | Los resultados cambian con otros motores. MySQL no soporta SUBSELECT igual. Oracle tiene optimizaciones distintas para batch fetching. Los numeros de queries son universales, pero los tiempos son especificos de PostgreSQL |
+| **Testcontainers (Docker)** | La BD corre en un container Docker local, no en un servidor dedicado. Latencia de red = 0. En produccion, la latencia de red amplifica la diferencia entre 1 query y 30,000 queries |
+| **Sin cache L2** | No hay cache de segundo nivel configurada (Ehcache, Caffeine). Con L2 cache, batch_fetch y @Transactional pueden ser mucho mas rapidos porque las entidades referenciadas ya estan en cache. @EntityGraph y DTO Projection bypasean la L2 cache |
+| **JVM cold start en algunos tests** | Aunque los benchmarks usan warmup, los tests de volumetria no lo hacen — sus tiempos incluyen JIT compilation. Los benchmarks (BenchmarkStoreTest, BenchmarkDepartmentTest) son mas fiables |
+| **Heap fijo (2GB)** | Los tests corren con -Xmx2g. Con mas heap, los tests de 10M podrian no dar OOM. Con menos, el umbral baja |
+
+**Lo que SI es fiable en estos resultados:**
+- El **conteo de queries** es exacto e independiente del entorno
+- Las **formulas de escalado** (1+7N, 1+ceil(N/16)*7, constante 7) son universales
+- La **proporcion de memoria** entre soluciones (2x entre entities y DTOs) se mantiene
+- Los **fallos** (MultipleBagFetchException, OOM, paginacion en memoria) son reproducibles en cualquier entorno

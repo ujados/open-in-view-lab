@@ -655,30 +655,58 @@ All three issue **1 SQL query**, but the amount of data transferred and memory c
 
 ### Cascade persist: the cost of saving complete graphs
 
-Saving a `Department` with 6 collections via `CascadeType.ALL` generates `2 + 6N` statements (1 region + 1 dept + N items per collection):
+Saving a `Department` with 6 collections via `CascadeType.ALL` generates `2 + 6N` statements (1 region + 1 dept + N items per collection). Median of 5 runs after 2 warmup:
 
-| Items/col | Statements | Time | Total items |
+| Items/col | Total items | Without batch (median) | With batch=50 (median) |
 |---:|---:|---:|---:|
-| 10 | 62 | 38ms | 60 |
-| 50 | 302 | 155ms | 300 |
-| 100 | 602 | 305ms | 600 |
-| 500 | 3,002 | 1,487ms | 3,000 |
+| 10 | 60 | 47ms | 71ms |
+| 50 | 300 | 175ms | 200ms |
+| 100 | 600 | 333ms | 366ms |
+| 500 | 3,000 | 1,579ms | 1,620ms |
 
-> **Test:** `CascadePersistTest` -- measures statements and time with and without `jdbc.batch_size`.
+With batch=50 it is **slower** than without batch. With `IDENTITY`, the batch_size configuration adds coordination overhead with no real benefit because each INSERT needs its own round-trip to obtain the generated ID.
+
+> **Test:** `BenchmarkWriteTest` -- cascade persist with and without batch, warmup=2, runs=5.
 
 ### jdbc.batch_size does NOT work with IDENTITY generation
 
-A lab finding: configuring `hibernate.jdbc.batch_size=50` **does not reduce the number of statements** when using `@GeneratedValue(strategy = GenerationType.IDENTITY)` (the default in PostgreSQL with auto-increment). Hibernate needs the generated ID back immediately after each INSERT, which prevents grouping multiple INSERTs into a single JDBC batch.
+A lab finding: configuring `hibernate.jdbc.batch_size=50` **does not reduce the number of statements** when using `@GeneratedValue(strategy = GenerationType.IDENTITY)` (the default in PostgreSQL with auto-increment). Hibernate needs the generated ID back immediately after each INSERT, which prevents grouping multiple INSERTs into a single JDBC batch. Median of 5 runs after 2 warmup:
 
-| Volume | Without batch | With batch=50 |
+| Volume | Without batch (median) | With batch=50 (median) |
 |---:|---:|---:|
-| 100 orders | 100 stmts, 143ms | 100 stmts, 92ms |
-| 1K orders | 1,000 stmts, 1s | 1,000 stmts, 934ms |
-| 5K orders | 5,000 stmts, 4.8s | 5,000 stmts, 4.5s |
+| 100 orders | 111ms | 113ms |
+| 1K orders | 953ms | 975ms |
+| 5K orders | 4,738ms | 4,718ms |
 
-**Statements identical.** For `jdbc.batch_size` to work, you need `GenerationType.SEQUENCE` with `@SequenceGenerator(allocationSize = 50)`. This allows Hibernate to pre-allocate IDs in blocks and batch the INSERTs.
+**Practically identical times.** For `jdbc.batch_size` to work, you need `GenerationType.SEQUENCE` with `@SequenceGenerator(allocationSize = 50)`. This allows Hibernate to pre-allocate IDs in blocks and batch the INSERTs.
 
-> **Test:** `BulkInsertTest` -- compares bulk insert with and without batch, confirming that IDENTITY prevents batching.
+> **Test:** `BenchmarkWriteTest` -- bulk insert with and without batch, warmup=2, runs=5.
+
+### StatelessSession: writing without persistence context
+
+For bulk inserts where you don't need dirty checking or cascade, `StatelessSession` eliminates the persistence context overhead entirely:
+
+```java
+try (StatelessSession session = sessionFactory.openStatelessSession()) {
+    session.beginTransaction();
+    for (int i = 0; i < count; i++) {
+        session.insert(order);
+    }
+    session.getTransaction().commit();
+}
+```
+
+Median of 5 runs after 2 warmup:
+
+| Volume | StatelessSession (median) | Session (median) |
+|---:|---:|---:|
+| 100 | 132ms | 115ms |
+| 1K | 982ms | 1,007ms |
+| 5K | 5,076ms | 4,880ms |
+
+With `GenerationType.IDENTITY`, the difference is **practically zero**. The bottleneck is not the persistence context but the round-trip per INSERT (1 per generated ID). StatelessSession shines with `GenerationType.SEQUENCE` where it can pre-allocate IDs and batch inserts.
+
+> **Test:** `BenchmarkWriteTest` -- StatelessSession vs Session, warmup=2, runs=5.
 
 ### Optimistic locking and OSIV
 

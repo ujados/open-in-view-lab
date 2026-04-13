@@ -658,30 +658,32 @@ Las tres hacen **1 query SQL**, pero la cantidad de datos transferidos y el cons
 
 ### Cascade persist: el coste de guardar grafos completos
 
-Guardar un `Department` con 6 colecciones via `CascadeType.ALL` genera `2 + 6N` statements (1 region + 1 dept + N items por cada coleccion):
+Guardar un `Department` con 6 colecciones via `CascadeType.ALL` genera `2 + 6N` statements (1 region + 1 dept + N items por cada coleccion). Mediana de 5 ejecuciones tras 2 warmup:
 
-| Items/col | Statements | Tiempo | Total items |
+| Items/col | Total items | Sin batch (mediana) | Con batch=50 (mediana) |
 |---:|---:|---:|---:|
-| 10 | 62 | 38ms | 60 |
-| 50 | 302 | 155ms | 300 |
-| 100 | 602 | 305ms | 600 |
-| 500 | 3,002 | 1,487ms | 3,000 |
+| 10 | 60 | 47ms | 71ms |
+| 50 | 300 | 175ms | 200ms |
+| 100 | 600 | 333ms | 366ms |
+| 500 | 3,000 | 1,579ms | 1,620ms |
 
-> **Test:** `CascadePersistTest` — mide statements y tiempo con y sin `jdbc.batch_size`.
+Con batch=50 es **mas lento** que sin batch. Con `IDENTITY`, la configuracion de batch_size añade overhead de coordinacion sin beneficio real porque cada INSERT necesita su propio round-trip para obtener el ID generado.
+
+> **Test:** `BenchmarkWriteTest` — cascade persist con y sin batch, warmup=2, runs=5.
 
 ### jdbc.batch_size NO funciona con IDENTITY generation
 
-Un descubrimiento del laboratorio: configurar `hibernate.jdbc.batch_size=50` **no reduce el numero de statements** cuando usas `@GeneratedValue(strategy = GenerationType.IDENTITY)` (que es el default en PostgreSQL con auto-increment). Hibernate necesita el ID generado de vuelta inmediatamente despues de cada INSERT, lo que impide agrupar multiples INSERTs en un solo batch JDBC.
+Un descubrimiento del laboratorio: configurar `hibernate.jdbc.batch_size=50` **no reduce el numero de statements** cuando usas `@GeneratedValue(strategy = GenerationType.IDENTITY)` (que es el default en PostgreSQL con auto-increment). Hibernate necesita el ID generado de vuelta inmediatamente despues de cada INSERT, lo que impide agrupar multiples INSERTs en un solo batch JDBC. Mediana de 5 runs tras 2 warmup:
 
-| Volumen | Sin batch | Con batch=50 |
+| Volumen | Sin batch (mediana) | Con batch=50 (mediana) |
 |---:|---:|---:|
-| 100 orders | 100 stmts, 143ms | 100 stmts, 92ms |
-| 1K orders | 1,000 stmts, 1s | 1,000 stmts, 934ms |
-| 5K orders | 5,000 stmts, 4.8s | 5,000 stmts, 4.5s |
+| 100 orders | 111ms | 113ms |
+| 1K orders | 953ms | 975ms |
+| 5K orders | 4,738ms | 4,718ms |
 
-**Statements identicos.** Para que `jdbc.batch_size` funcione, necesitas `GenerationType.SEQUENCE` con `@SequenceGenerator(allocationSize = 50)`. Esto permite que Hibernate pre-aloque IDs en bloques y agrupe los INSERTs.
+**Tiempos practicamente identicos.** Para que `jdbc.batch_size` funcione, necesitas `GenerationType.SEQUENCE` con `@SequenceGenerator(allocationSize = 50)`. Esto permite que Hibernate pre-aloque IDs en bloques y agrupe los INSERTs.
 
-> **Test:** `BulkInsertTest` — compara bulk insert con y sin batch, confirmando que IDENTITY impide el batching.
+> **Test:** `BenchmarkWriteTest` — bulk insert con y sin batch, warmup=2, runs=5.
 
 ### StatelessSession: escritura sin persistence context
 
@@ -697,15 +699,17 @@ try (StatelessSession session = sessionFactory.openStatelessSession()) {
 }
 ```
 
-| Volumen | StatelessSession | Session (con PC) |
+Mediana de 5 runs tras 2 warmup:
+
+| Volumen | StatelessSession (mediana) | Session (mediana) |
 |---:|---:|---:|
-| 100 | 130ms | 185ms |
-| 1K | 1,103ms | 1,130ms |
-| 5K | 5,220ms | 5,100ms |
+| 100 | 132ms | 115ms |
+| 1K | 982ms | 1,007ms |
+| 5K | 5,076ms | 4,880ms |
 
-Con `GenerationType.IDENTITY`, la diferencia es minima porque el bottleneck es el round-trip por cada INSERT (1 por cada ID generado). StatelessSession brilla mas con `GenerationType.SEQUENCE` donde puede pre-alocar IDs y agrupar inserts.
+Con `GenerationType.IDENTITY`, la diferencia es **practicamente nula**. El bottleneck no es el persistence context sino el round-trip por cada INSERT (1 por cada ID generado). StatelessSession brilla con `GenerationType.SEQUENCE` donde puede pre-alocar IDs y agrupar inserts.
 
-> **Test:** `StatelessSessionTest` — StatelessSession vs Session con flush+clear cada 50 entidades.
+> **Test:** `BenchmarkWriteTest` — StatelessSession vs Session, warmup=2, runs=5.
 
 ### Optimistic locking y OSIV
 
